@@ -28,8 +28,6 @@ setGlobalOptions({maxInstances: 10});
 
 const app = express();
 
-const FREE_TIER_LIMIT = 2; // 2 requests per day
-
 // --- Stripe Webhook ---
 // We need to use express.raw for the webhook endpoint so that the raw body is preserved.
 // Stripe requires the raw body to verify the signature.
@@ -56,15 +54,15 @@ app.post('/v1/stripe-webhook', express.raw({type: 'application/json'}), async (r
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object as Stripe.Checkout.Session;
         
-        const userId = session.metadata?.userId;
+        const userId = session.client_reference_id;
         const priceId = session.line_items?.data[0]?.price?.id;
 
         if (!userId || !priceId) {
-            logger.error('Missing userId or priceId in checkout session metadata.', { session_id: session.id });
+            logger.error('Missing userId or priceId in checkout session.', { session_id: session.id });
             return res.status(400).send('Webhook Error: Missing metadata.');
         }
         
-        logger.info(`Processing successful payment for user: ${userId}, price: ${priceId}`);
+        logger.info(`Processing successful payment for user ${userId}, price: ${priceId}`);
 
         const result = await addCreditsToUser(userId, priceId);
         
@@ -80,24 +78,24 @@ app.post('/v1/stripe-webhook', express.raw({type: 'application/json'}), async (r
 // All other routes should use express.json()
 app.use(express.json());
 
-
-// Middleware to authenticate Firebase ID token
+// Middleware to verify Firebase ID token
 const authenticateFirebaseToken = async (req: Request, res: Response, next: NextFunction) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).send({ error: 'Unauthorized: No token provided.' });
-    }
-    const idToken = authHeader.split('Bearer ')[1];
-    try {
-      const decodedToken = await getAuth().verifyIdToken(idToken);
-      (req as any).user = decodedToken; // Add user to request object
-      next();
-    } catch (error) {
-      logger.error('Error verifying Firebase ID token:', error);
-      return res.status(403).send({ error: 'Unauthorized: Invalid token.' });
-    }
-  };
+    const auth = getAuth();
+    const token = req.headers.authorization?.split('Bearer ')[1];
 
+    if (!token) {
+        return res.status(401).send({ error: 'Unauthorized: No token provided.' });
+    }
+
+    try {
+        const decodedToken = await auth.verifyIdToken(token);
+        res.locals.user = decodedToken; // Add user to response locals
+        return next();
+    } catch (error) {
+        logger.error('Firebase token verification failed:', error);
+        return res.status(403).send({ error: 'Unauthorized: Invalid token.' });
+    }
+};
 
 // Middleware for API Key Authentication and Rate Limiting
 const authenticateAndRateLimit = async (
@@ -106,16 +104,6 @@ const authenticateAndRateLimit = async (
   next: NextFunction
 ) => {
   const db = getDb();
-  // bypass auth for checkout creation and webhooks
-  if (req.path.startsWith('/v1/create-checkout-session') || req.path.startsWith('/api/v1/stripe-webhook')) {
-    return next();
-  }
-
-  // Bypass API key check for trend-forecast route, which uses Firebase Auth
-  if (req.path === '/v1/trend-forecast') {
-      return next();
-  }
-
   const apiKey = req.headers['x-api-key'] as string;
 
   if (!apiKey) {
@@ -190,15 +178,16 @@ const authenticateAndRateLimit = async (
   }
 };
 
-app.use(authenticateAndRateLimit);
-
 // --- API Endpoints ---
 
 // POST /v1/create-checkout-session
 app.post(
   '/v1/create-checkout-session',
+  authenticateFirebaseToken,
   async (req: Request, res: Response) => {
-    const {priceId, successUrl, cancelUrl, userId} = req.body;
+    const {priceId, successUrl, cancelUrl} = req.body;
+    const { uid } = res.locals.user;
+
 
     if (!priceId) {
       return res.status(400).send({error: 'Price ID is missing.'});
@@ -208,10 +197,7 @@ app.post(
         .status(400)
         .send({error: 'Success and cancel URLs are required.'});
     }
-     if (!userId) {
-      return res.status(400).send({ error: 'User ID is missing.' });
-    }
-
+    
     try {
       // Initialize Stripe
       const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
@@ -228,9 +214,7 @@ app.post(
         mode: 'payment',
         success_url: successUrl,
         cancel_url: cancelUrl,
-        metadata: {
-            userId: userId,
-        }
+        client_reference_id: uid,
       });
 
       return res.status(200).send({sessionId: session.id, url: session.url});
@@ -244,39 +228,59 @@ app.post(
 );
 
 
-// POST /v1/trend-forecast - New endpoint for the main app UI
+// POST /v1/trend-forecast - Firebase Auth
 app.post('/v1/trend-forecast', authenticateFirebaseToken, async (req: Request, res: Response) => {
+    const { uid } = res.locals.user;
     const { input, timeHorizon } = req.body;
-    const user = (req as any).user;
-    
+    const db = getDb();
+  
     if (!input || !timeHorizon) {
       return res.status(400).send({ error: 'Request must include "input" and "timeHorizon".' });
     }
   
     try {
-      const db = getDb();
-      const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-      const usageDocRef = db.collection('daily_usage').doc(`${user.uid}_${today}`);
-      const usageDoc = await usageDocRef.get();
+      const userRef = db.collection('users').doc(uid);
+      const userDoc = await userRef.get();
+      const userData = userDoc.data();
+      const now = new Date();
+      const todayStr = now.toISOString().split('T')[0]; // YYYY-MM-DD
   
-      if (usageDoc.exists && (usageDoc.data()?.count || 0) >= FREE_TIER_LIMIT) {
-        return res.status(429).send({ error: 'You have exceeded the free daily limit of 2 trend reports.' });
+      let canForecast = false;
+  
+      if (userData?.ai_credits && userData.ai_credits > 0) {
+        // User has credits, allow and decrement
+        await userRef.update({ 'ai_credits': (userData.ai_credits || 0) - 1 });
+        canForecast = true;
+      } else {
+        // Check free daily limit
+        const lastFreeUsage = userData?.last_free_usage_date;
+        if (lastFreeUsage !== todayStr) {
+          // It's a new day, allow and update timestamp
+          await userRef.set({ last_free_usage_date: todayStr }, { merge: true });
+          canForecast = true;
+        } else {
+          return res.status(429).send({ 
+            success: false, 
+            error: 'You have used your free trend report for today. Please purchase credits to continue.' 
+          });
+        }
       }
-  
-      const result = await trendForecast({ input, timeHorizon });
       
-      const currentCount = usageDoc.exists ? (usageDoc.data()?.count || 0) : 0;
-      await usageDocRef.set({ count: currentCount + 1, lastRequest: new Date() }, { merge: true });
-  
-      return res.status(200).send({ success: true, data: result });
+      if (canForecast) {
+        const result = await trendForecast({ input, timeHorizon });
+        return res.status(200).send({ success: true, data: result });
+      } else {
+        // This case should not be hit due to the logic above, but it's a safeguard
+        return res.status(403).send({ success: false, error: 'Not authorized to perform a forecast.' });
+      }
     } catch (e: any) {
       logger.error('Error in /v1/trend-forecast:', e);
       return res.status(500).send({ success: false, error: e.message || 'An unexpected error occurred.' });
     }
   });
 
-// GET /v1/trends
-app.get('/v1/trends', (req: Request, res: Response) => {
+// GET /v1/trends - API Key Auth
+app.get('/v1/trends', authenticateAndRateLimit, (req: Request, res: Response) => {
   // Placeholder for fetching real-time trends
   // You can apply tier-based result limiting here using res.locals.keyData
   const tier = res.locals.keyData.tier;
@@ -290,8 +294,8 @@ app.get('/v1/trends', (req: Request, res: Response) => {
   });
 });
 
-// POST /v1/predict
-app.post('/v1/predict', async (req: Request, res: Response) => {
+// POST /v1/predict - API Key Auth
+app.post('/v1/predict', authenticateAndRateLimit, async (req: Request, res: Response) => {
   const {topic} = req.body;
   if (!topic) {
     return res.status(400).send({error: 'Prediction "topic" is missing.'});
@@ -340,8 +344,10 @@ app.post('/v1/predict', async (req: Request, res: Response) => {
   }
 });
 
+// --- AI TOOLS - Firebase Auth ---
+
 // POST /v1/generate-captions
-app.post('/v1/generate-captions', async (req: Request, res: Response) => {
+app.post('/v1/generate-captions', authenticateFirebaseToken, async (req: Request, res: Response) => {
   const {topic, tone} = req.body;
   if (!topic || !tone) {
     return res
@@ -360,7 +366,7 @@ app.post('/v1/generate-captions', async (req: Request, res: Response) => {
 });
 
 // POST /v1/find-hashtags
-app.post('/v1/find-hashtags', async (req: Request, res: Response) => {
+app.post('/v1/find-hashtags', authenticateFirebaseToken, async (req: Request, res: Response) => {
   const {topic} = req.body;
   if (!topic) {
     return res.status(400).send({error: 'Request body must include "topic".'});
@@ -377,7 +383,7 @@ app.post('/v1/find-hashtags', async (req: Request, res: Response) => {
 });
 
 // POST /v1/best-time-to-post
-app.post('/v1/best-time-to-post', async (req: Request, res: Response) => {
+app.post('/v1/best-time-to-post', authenticateFirebaseToken, async (req: Request, res: Response) => {
   const {industry, platform} = req.body;
   if (!industry || !platform) {
     return res
