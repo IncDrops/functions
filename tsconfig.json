@@ -12,9 +12,13 @@
     "strict": true,
     "baseUrl": ".",
     "paths": {
+<<<<<<< HEAD
+      "@/*": ["./src/*"]
+=======
       "@/*": [
         "src/*"
       ]
+>>>>>>> 19c9e617f3d8acb0c1c5bafa285060f66a459448
     }
   },
   "compileOnSave": true,
